@@ -530,45 +530,98 @@ mkdir -p ~/acore_backups/sql
 ```
 
 Create the dump script:
-```bash
-tee ~/acore_backups/dump-acore-db.sh > /dev/null <<'EOF'
+```
 #!/usr/bin/env bash
+
 set -euo pipefail
+# ^ Safety settings (strongly recommended in scripts):
+#   -e  : exit immediately if any command fails (non-zero exit code)
+#   -u  : treat unset variables as an error (catches typos / missing vars)
+#   -o pipefail : if you pipe commands (A | B), the script fails if ANY part fails
 
 OUTDIR="$HOME/acore_backups/sql"
+# ^ Where backups will be stored on the VM. "$HOME" is your user's home folder.
+#   Example path: /home/banana/acore_backups/sql
+
 KEEP_DAYS=7
+# ^ Retention: keep backups for 7 days. Older ones will be deleted.
+
+DBCONT="ac-database"
+# ^ Name of the Docker container running the database (MariaDB/MySQL) in AzerothCore.
+#   This matches what you see in "docker ps" (usually ac-database).
 
 mkdir -p "$OUTDIR"
+# ^ Create the backup folder if it doesn't exist yet.
+#   -p means: also create parent folders, and don't error if it already exists.
 
-# Read MySQL root password from the DB container environment
-DBPASS="$(docker exec -it ac-database printenv MYSQL_ROOT_PASSWORD | tr -d '\r')"
+DBPASS="$(docker exec "$DBCONT" printenv MYSQL_ROOT_PASSWORD | tr -d '\r\n')"
+# ^ Read the MySQL root password from INSIDE the DB container:
+#   - docker exec <container> <command> runs a command inside the container.
+#   - printenv MYSQL_ROOT_PASSWORD prints the value of that environment variable.
+#   - tr -d '\r\n' strips line breaks (carriage return + newline) so the password
+#     becomes a clean single-line string we can safely use.
+
+[[ -n "$DBPASS" ]] || { echo "Could not read MYSQL_ROOT_PASSWORD from $DBCONT" >&2; exit 1; }
+# ^ Sanity check:
+#   [[ -n "$DBPASS" ]] means "is DBPASS non-empty?"
+#   If it IS empty, we:
+#     - print an error message to stderr (>&2)
+#     - exit with error code 1
+#   This prevents creating empty/invalid dumps if the password can't be read.
 
 for db in acore_auth acore_characters; do
-  docker exec ac-database sh -c "mysqldump -uroot -p\"$DBPASS\" --single-transaction --routines --triggers $db"     > "$OUTDIR/${db}-$(date +%F).sql"
+  # ^ Loop over the two databases we actually care about:
+  #   acore_auth       = accounts / realm login related data
+  #   acore_characters = your characters, gold, items, etc.
+  #   (acore_world is big and usually rebuildable, so we skip it to save space.)
+
+  out="$OUTDIR/${db}-$(date +%F).sql"
+  # ^ Output filename for this database dump.
+  #   $(date +%F) produces YYYY-MM-DD (e.g., 2026-02-18)
+  #   Example: acore_characters-2026-02-18.sql
+
+  docker exec "$DBCONT" sh -c \
+    "mysqldump -uroot -p\"$DBPASS\" --single-transaction --quick --routines --triggers $db" \
+    > "$out"
+  # ^ This creates a SQL dump of the database from inside the container:
+  #   - docker exec "$DBCONT" sh -c "..." runs a shell in the container and executes the string.
+  #
+  #   mysqldump options explained:
+  #   -uroot                 : connect as MySQL user "root"
+  #   -p"$DBPASS"            : use the password we read earlier
+  #   --single-transaction   : makes a consistent snapshot for InnoDB without stopping the DB
+  #                           (best practice for online backups)
+  #   --quick                : stream rows instead of buffering them (uses less RAM)
+  #   --routines --triggers  : include stored routines and triggers (if present)
+  #
+  #   The "> $out" at the end:
+  #   - redirects the dump output (stdout) into a file on the VM (outside the container).
 done
 
-# compress dumps to save space
-gzip -9f "$OUTDIR/"*.sql
+find "$OUTDIR" -maxdepth 1 -type f -name "*.sql" -print0 | xargs -0 -r gzip -9f
+# ^ Compress any newly created .sql files to save space:
+#   find ... -name "*.sql"   : locate SQL dump files in OUTDIR
+#   -maxdepth 1              : only this folder (not subfolders)
+#   -type f                  : files only
+#   -print0                  : safe output even if filenames contain spaces
+#   xargs -0                 : read that safe (NUL-separated) list
+#   -r                       : do nothing if the list is empty (prevents errors)
+#   gzip -9f                 : compress with max compression (-9) and overwrite (-f) if needed
+# Result: *.sql becomes *.sql.gz and the original .sql is replaced.
 
-# prune old dumps (space-friendly)
 find "$OUTDIR" -type f -name "*.gz" -mtime +"$KEEP_DAYS" -delete
-EOF
-
-chmod +x ~/acore_backups/dump-acore-db.sh
+# ^ Retention cleanup (keep disk usage bounded):
+#   -type f                  : only files
+#   -name "*.gz"             : only compressed backups
+#   -mtime +7                : files older than 7 * 24 hours
+#   -delete                  : remove them
+#
+# Note: -mtime is "age in days" (24h blocks). This is close to "keep 7 days",
+# which is what you want for simple rolling retention.
 ```
 
-Of course you want to know what happens on a command flag level therefore: 
-
-**What the key flags do (quick):**
-- `set -euo pipefail`: fail fast (**e**rror, **u**nset vars, pipeline errors)
-- `mysqldump --single-transaction`: consistent snapshot *without stopping* InnoDB tables
-- `--routines --triggers`: include stored routines/triggers if present
-- `gzip -9f`: maximum compression (`-9`), overwrite existing (`-f`)
-- `find ... -type f -name "*.gz" -mtime +"$KEEP_DAYS" -delete`:
-  - `-type f`: only files (not folders)
-  - `-name "*.gz"`: only compressed dumps
-  - `-mtime +N`: older than **N** days
-  - `-delete`: remove them (keeps disk usage bounded)
+make it executable: 
+`chmod +x dump-acore-db.sh`
 
 Test once:
 ```bash
@@ -583,17 +636,29 @@ crontab -e
 
 Add:
 ```cron
-15 3 * * * /bin/bash -lc '$HOME/acore_backups/dump-acore-db.sh >/dev/null 2>&1'
+15 3 * * * /bin/bash -lc '/home/banana/acore_backups/dump-acore-db.sh >/dev/null 2>&1'
 ```
-- `/bin/bash -lc`: runs as a login shell so `$HOME` etc. resolve reliably
-- `>/dev/null 2>&1`: silence stdout+stderr (check files in `~/acore_backups/sql` instead)
 
-**Restore example (during rebuild):**
-```bash
-DBPASS="$(docker exec -it ac-database printenv MYSQL_ROOT_PASSWORD | tr -d '\r')"
-
-gunzip -c ~/acore_backups/sql/acore_characters-YYYY-MM-DD.sql.gz |   docker exec -i ac-database mysql -uroot -p"$DBPASS" acore_characters
+**Restore example (during rebuild):** --> hope this never happens but it it should, no worries, we'll fix it ;) 
 ```
-- `gunzip -c`: decompress to stdout (doesn’t modify the file)
-- `docker exec -i`: `-i` pipes stdin into the container
+# Read DB root password from inside the running DB container and store it in a variable.
+# - DBPASS is just a variable name ("box") that holds the password as text.
+# - $(...) runs the command and captures its output.
+# - docker exec ... printenv MYSQL_ROOT_PASSWORD prints the env var from the container.
+# - tr -d '\r\n' removes line breaks so the password is clean.
+
+DBPASS="$(docker exec ac-database printenv MYSQL_ROOT_PASSWORD | tr -d '\r\n')"
+
+# Restore: stream the compressed SQL dump directly into MySQL inside the container.
+# - gunzip -c outputs decompressed SQL to stdout (does NOT create a .sql file).
+# - | pipes that SQL into the next command.
+# - docker exec -i keeps stdin open so MySQL can read the piped SQL.
+# - mysql -uroot -p"$DBPASS" connects as root using the password from DBPASS.
+# - acore_characters is the target database to import into.
+gunzip -c ~/acore_backups/sql/acore_characters-YYYY-MM-DD.sql.gz \
+  | docker exec -i ac-database mysql -uroot -p"$DBPASS" acore_characters
+
+```
+
+
 
