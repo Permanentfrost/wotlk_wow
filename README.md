@@ -381,3 +381,219 @@ At this point you have:
 - Realm address in the DB set to the VM IP (and not 127.0.0.1)
 
 Happy adventuring and hope the nostalgia hits ;) 🏔️⚔️
+
+
+
+Almost forgot this addition: 
+
+# 12) Security + Backups (minimal impact, low effort)
+
+This chapter adds **basic hardening** (without breaking LAN gameplay) and a **space-friendly backup plan**. 
+At the time of writing (February 2026) prices for RAM + SSDs are enormous so trying to keep a low overhead. 
+
+---
+
+## Question you might have: Is my VM/server exposed to the Internet?
+
+In a typical home LAN, your WoW server is **not Internet-exposed** unless you configured **router port forwarding (NAT)** to the VM (or put the VM in a DMZ / gave it a public IP).
+
+Of course you can always 
+**Check what’s listening on the VM (ports + owning processes):**
+```bash
+sudo ss -tulpn | egrep ':(22|3724|8085)\b'
+```
+- `ss`: socket status
+- `-tulpn`: **t**cp, **u**dp, **l**istening, **p**rocess, **n**umeric ports/IPs
+- `egrep ...`: filter for SSH (22), Auth (3724), World (8085)
+
+**Check what Docker publishes (your “attack surface” on the VM’s network interfaces):**
+```bash
+docker ps --format 'table {{.Names}}\t{{.Ports}}'
+```
+If you see `0.0.0.0:3724->3724/tcp` / `0.0.0.0:8085->8085/tcp`, that’s normal for **LAN access**.  
+Again: To confirm Internet exposure, check your **router** for any **port forward rules** to your VM IP on **3724/8085**. I find this to be the best source of information. 
+
+---
+
+## 12.2 Firewall (UFW): allow only LAN access
+
+This keeps gameplay working (Steam Deck on the same LAN) while blocking inbound traffic from anywhere else.
+
+```bash
+sudo apt update
+sudo apt install -y ufw
+
+# deny all inbound by default; allow outbound
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+
+# SSH only from LAN (tighten further to your admin PC IP if you want)
+sudo ufw allow from 192.168.1.0/24 to any port 22 proto tcp
+
+# WoW ports only from LAN
+sudo ufw allow from 192.168.1.0/24 to any port 3724 proto tcp
+sudo ufw allow from 192.168.1.0/24 to any port 8085 proto tcp
+
+sudo ufw enable
+sudo ufw status verbose
+```
+
+Notes:
+- `from 192.168.1.0/24` restricts access to **your LAN subnet** (adjust if yours differs).
+- `proto tcp` is explicit (WoW Auth/World are TCP in this setup).
+
+---
+
+## 12.3 Automatic security updates (weekly ~04:00)
+
+Install unattended upgrades:
+```bash
+sudo apt update
+sudo apt install -y unattended-upgrades
+```
+- `-y` auto-confirms prompts (non-interactive install)
+
+Enable it (creates default config):
+```bash
+sudo dpkg-reconfigure -plow unattended-upgrades
+```
+- `-plow` uses the low-priority dialog flow (simple prompts)
+
+### Run updates weekly via systemd timer 
+
+1) Create override directories:
+```bash
+sudo mkdir -p /etc/systemd/system/unattended-upgrades.service.d
+sudo mkdir -p /etc/systemd/system/unattended-upgrades.timer.d
+```
+
+2) Ensure the service runs the upgrade command:
+```bash
+sudo tee /etc/systemd/system/unattended-upgrades.service.d/override.conf > /dev/null <<'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/bin/unattended-upgrade
+EOF
+```
+- The blank `ExecStart=` line **clears** the original command so we can replace it.
+
+3) Schedule weekly at 04:00 (Sunday) + small random delay:
+```bash
+sudo tee /etc/systemd/system/unattended-upgrades.timer.d/override.conf > /dev/null <<'EOF'
+[Timer]
+OnCalendar=
+OnCalendar=Sun *-*-* 04:00:00
+Persistent=true
+RandomizedDelaySec=15m
+EOF
+```
+- `OnCalendar=Sun *-*-* 04:00:00`: weekly every Sunday at 04:00
+- `Persistent=true`: if the VM was off, it runs after next boot
+- `RandomizedDelaySec=15m`: spreads load (useful if many hosts patch)
+
+4) Reload + enable:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now unattended-upgrades.timer
+systemctl list-timers | grep unattended
+```
+
+---
+
+## 12.4 Backups (Important!) 
+
+We have two of these, once the VM on Proxmox level and once the DB inside the VM - your gold and items ;-). 
+Remember: below applies to how I play (mostly weekends). 
+
+### A) Proxmox VM backups (weekly, keep only 3)
+
+Because storage is limited and I play is mostly on weekends:
+- run **one Proxmox backup per week**
+- keep only the last **3** backups (≈ last 3 weeks)
+
+In Proxmox: **Datacenter → Backup → Add**
+- Schedule: weekly (e.g., Sunday night / early morning)
+- Mode: **Stop** is the most consistent for databases (Snapshot is okay, but less strict)
+- Retention: **Keep last = 3**
+
+---
+
+### B) Database backups (daily 03:15, keep only a few)
+
+Back up only what matters most:
+- `acore_auth`
+- `acore_characters`
+
+Create folders:
+```bash
+mkdir -p ~/acore_backups/sql
+```
+
+Create the dump script:
+```bash
+tee ~/acore_backups/dump-acore-db.sh > /dev/null <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+OUTDIR="$HOME/acore_backups/sql"
+KEEP_DAYS=7
+
+mkdir -p "$OUTDIR"
+
+# Read MySQL root password from the DB container environment
+DBPASS="$(docker exec -it ac-database printenv MYSQL_ROOT_PASSWORD | tr -d '\r')"
+
+for db in acore_auth acore_characters; do
+  docker exec ac-database sh -c "mysqldump -uroot -p\"$DBPASS\" --single-transaction --routines --triggers $db"     > "$OUTDIR/${db}-$(date +%F).sql"
+done
+
+# compress dumps to save space
+gzip -9f "$OUTDIR/"*.sql
+
+# prune old dumps (space-friendly)
+find "$OUTDIR" -type f -name "*.gz" -mtime +"$KEEP_DAYS" -delete
+EOF
+
+chmod +x ~/acore_backups/dump-acore-db.sh
+```
+
+Of course you want to know what happens on a command flag level therefore: 
+
+**What the key flags do (quick):**
+- `set -euo pipefail`: fail fast (**e**rror, **u**nset vars, pipeline errors)
+- `mysqldump --single-transaction`: consistent snapshot *without stopping* InnoDB tables
+- `--routines --triggers`: include stored routines/triggers if present
+- `gzip -9f`: maximum compression (`-9`), overwrite existing (`-f`)
+- `find ... -type f -name "*.gz" -mtime +"$KEEP_DAYS" -delete`:
+  - `-type f`: only files (not folders)
+  - `-name "*.gz"`: only compressed dumps
+  - `-mtime +N`: older than **N** days
+  - `-delete`: remove them (keeps disk usage bounded)
+
+Test once:
+```bash
+~/acore_backups/dump-acore-db.sh
+ls -lh ~/acore_backups/sql
+```
+
+Schedule daily at **03:15**:
+```bash
+crontab -e
+```
+
+Add:
+```cron
+15 3 * * * /bin/bash -lc '$HOME/acore_backups/dump-acore-db.sh >/dev/null 2>&1'
+```
+- `/bin/bash -lc`: runs as a login shell so `$HOME` etc. resolve reliably
+- `>/dev/null 2>&1`: silence stdout+stderr (check files in `~/acore_backups/sql` instead)
+
+**Restore example (during rebuild):**
+```bash
+DBPASS="$(docker exec -it ac-database printenv MYSQL_ROOT_PASSWORD | tr -d '\r')"
+
+gunzip -c ~/acore_backups/sql/acore_characters-YYYY-MM-DD.sql.gz |   docker exec -i ac-database mysql -uroot -p"$DBPASS" acore_characters
+```
+- `gunzip -c`: decompress to stdout (doesn’t modify the file)
+- `docker exec -i`: `-i` pipes stdin into the container
+
