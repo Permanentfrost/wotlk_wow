@@ -1,5 +1,8 @@
 # AzerothCore WotLK on Proxmox (Debian VM) + Steam Deck Client (Proton Experimental)
-*A full end-to-end guide including common pitfalls (trust me... I fell into all of them) you could hit during set up of a private World of Warcraft Server to play from your Steam Deck (Docker Compose v2, permissions, long client-data init, realm IP = 127.0.0.1, etc.).*
+
+*A full end-to-end guide including common pitfalls you could hit during set up of a private World of Warcraft Server to play from your Steam Deck.*
+
+Trust me... I fell into all of them: Docker Compose v2 issue, permissions, long client-data init, realm IP wrongly assigned as 127.0.0.1, etc..
 
 Bear in mind: the server is most important part of this guide as you can GPT your way of setting up the client installation on any plattform (Windows, other Linux Distros and MacOS). 
 
