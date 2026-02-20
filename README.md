@@ -7,6 +7,15 @@ Trust me... I fell into all of them: Docker Compose v2 issue, permissions, long 
 Bear in mind: the server is most important part of this guide as you can GPT your way of setting up the client installation on any plattform (Windows, other Linux Distros and MacOS). 
 
 
+### The Game Plan (What this guide covers)
+* **Prep the Server:** Spin up a well-optimized Debian VM on Proxmox.
+* **Build the Core:** Safely install Docker, clone AzerothCore, and compile the
+server (using `tmux` so you don't lose progress).
+* **Account Setup:** Launch the worldserver and create your in-game admin account.
+* **Steam Deck Config:** Point your `realmlist.wtf` to the VM and run the WoW client via SteamOS Proton Experimental.
+* **Squash the Bugs:** Fix the "`127.0.0.1` database routing issue" so your Deck can actually log in.
+* **Protect Your Loot:** Set up automated weekly security patches and daily database backups so you never lose your progress.
+
 
 ---
 
@@ -255,6 +264,8 @@ As long as it contains:
 - `Interface/`
 - etc.
 
+Tip: Transfer your pre-installed WotLK client (the whole folder!) from your PC to your Steam Deck using a USB-C flash drive, miniSD Card or via network transfer. 
+
 ### Set realmlist.wtf
 Edit one of:
 - `Data/enUS/realmlist.wtf` or
@@ -305,6 +316,11 @@ docker restart ac-authserver ac-worldserver
 
 After this, realm selection should work immediately.
 
+> [!WARNING]
+> Above SQL update query specifies `WHERE id=1`. This is perfectly fine for a fresh install (which we assume here).
+However, if you messed around and created a second realm during setup, this ID might be 2 or 3. 
+
+
 ---
 
 ## 9) Firewall / Ports
@@ -342,6 +358,9 @@ If you ever want to fully stop it:
 cd ~/azerothcore
 docker compose down
 ```
+
+> [!CAUTION]
+> Watch the control flags `-v` !! DO NOT run docker `compose down -v` unless you intend to` completely wipe your databases and server volumes. 
 
 ---
 
@@ -442,6 +461,12 @@ Notes:
 - `from 192.168.1.0/24` restricts access to **your LAN subnet** (adjust if yours differs).
 - `proto tcp` is explicit (WoW Auth/World are TCP in this setup).
 
+> [!IMPORTANT]
+> Apparently Docker so somehow bypasses UFW (not sure how though). This firewall setup
+restricts non-Docker services (like SSH), but Docker containers will still be accessible to
+your entire LAN.
+
+
 ---
 
 ## 12.3 Automatic security updates (weekly ~04:00)
@@ -530,7 +555,7 @@ mkdir -p ~/acore_backups/sql
 ```
 
 Create the dump script:
-```
+```bash
 #!/usr/bin/env bash
 
 set -euo pipefail
