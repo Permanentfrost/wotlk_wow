@@ -48,9 +48,10 @@ Example VM IP used in this guide: `192.168.1.118`
 
 General tip regarding passwords: 
 Normally I'd be writing down security related stuff and tipps here but honestly I kept it pretty easy through the whole set up for me. 
-Just to simplify your set up and testing user easy usernames and passwords - otherwise you question your sanity (because I did!). 
+Just to simplify your set up and testing with "user-easy" usernames and passwords - otherwise you question your sanity (because I did!). 
+**Also:** You are **local LAN only** (hopefully) so ideally attack vectors are pretty much non-existent.  
 
-In this guide I took username `banana` and pw `banana`just to keep it simple :-) 
+**So that means-->** In this guide I took username `banana` and pw `banana`just to keep it simple :-) 
 
 ---
 
@@ -686,4 +687,264 @@ gunzip -c ~/acore_backups/sql/acore_characters-YYYY-MM-DD.sql.gz \
 ```
 
 
+# 13) Optional: Add Playerbots + Auction House Bot (Solo-friendly “alive world”)
+
+So after a while this might strike you as boring since of course a big part of the fun are other players and functions like an auction house. 
+Therefore this chapter upgrades our standard AzerothCore Docker setup with:
+
+- **Playerbots**: These are NPC “players” that level, group, quest, etc.
+- **Auction House Bot**: keeps the Auction House populated
+
+> [!IMPORTANT]
+> Playerbots and an Auction House Bot are **separate modules**. Playerbots alone does **not** auto-fill the AH. (At first I thought it is, so just FYI.)
+
+---
+
+## 13.1 Before starting back it up (don’t lose your character / progress)
+
+1) **DB backup (point of no return)**  
+Run the DB dump script once before migrating anything:
+```bash
+~/acore_backups/dump-acore-db.sh
+
+#verify its there by just using ls
+ls -lh
+```
+
+2) **Stop containers safely**  
+Some `acore.sh` wrappers do **not** support `docker stop` / `docker install` and will print `Unknown or empty arg`.
+This happened to me and azerothcore actually prints the solution I just didnt get it first. 
+
+Use Docker Compose directly:
+```bash
+cd ~/azerothcore
+docker compose down --remove-orphans
+```
+
+> [!WARNING]
+> Again: **Never** use `docker compose down -v` unless you want to wipe your DB volumes.
+
+---
+
+## 13.2 Install Playerbots (Playerbot branch + module)
+
+I mean, yes you ideally have a) the proxmox snapshot and b) the backup job you did separately, but I **love** redundancy when it comes to backups therefore: 
+
+### A) Keep an “undo button”
+```bash
+cd ~
+mv azerothcore azerothcore_old
+```
+
+### B) Clone the Playerbot branch (fresh install)
+```bash
+cd ~
+git clone https://github.com/mod-playerbots/azerothcore-wotlk.git --branch Playerbot azerothcore
+```
+
+### C) Add the playerbots module
+```bash
+mkdir -p ~/azerothcore/modules
+cd ~/azerothcore/modules
+git clone https://github.com/mod-playerbots/mod-playerbots.git --branch master
+```
+
+### D) Mount modules into the worldserver container
+Create:
+```bash
+nano ~/azerothcore/docker-compose.override.yml
+```
+
+Paste:
+```yaml
+services:
+  ac-worldserver:
+    volumes:
+      - ./modules:/azerothcore/modules:ro
+```
+
+### E) Build + start
+```bash
+cd ~/azerothcore
+./acore.sh docker build
+./acore.sh docker start:app:d
+docker compose ps
+```
+
+---
+
+## 13.3 Configure Playerbots (reduce load + make grouping less annoying)
+
+### A) Find the correct config folder (pitfall I stumbled into)
+Depending on your Docker env, configs may live under **`env/dist`** (not `env/docker`).
+
+Check:
+```bash
+ls -la ~/azerothcore/env
+ls -la ~/azerothcore/env/dist/etc/modules 2>/dev/null || true
+```
+
+### B) Create your real config from the `.dist` template
+```bash
+cp ~/azerothcore/env/dist/etc/modules/playerbots.conf.dist \
+   ~/azerothcore/env/dist/etc/modules/playerbots.conf
+nano ~/azerothcore/env/dist/etc/modules/playerbots.conf
+```
+
+### C) Recommended settings (solo-friendly)
+- Cap bots at **50** (less lag)
+- Make bots accept group invites (fixes “you’re too low level” which means they'll just deny you)
+
+```ini
+AiPlayerbot.RandomBotAutologin = 1
+AiPlayerbot.MinRandomBots = 50
+AiPlayerbot.MaxRandomBots = 50
+
+# 0=GM only, 1=level-based, 2=always accept
+AiPlayerbot.GroupInvitationPermission = 2
+```
+
+Restart:
+```bash
+docker restart ac-worldserver
+```
+
+---
+
+## 13.4 Add an Auction House Bot (AHBot) so the AH is not empty
+
+### Why this is needed
+Playerbots ≠ AH population. If you want a living AH, add the separate **mod-ah-bot** module.
+
+### A) Install module
+```bash
+cd ~/azerothcore/modules
+git clone https://github.com/azerothcore/mod-ah-bot.git
+```
+
+Rebuild (new C++ module):
+```bash
+cd ~/azerothcore
+./acore.sh docker build
+./acore.sh docker start:app:d
+```
+
+### B) Import required SQL into `acore_world` (critical step)
+```bash
+DBPASS="$(docker exec ac-database printenv MYSQL_ROOT_PASSWORD | tr -d '\r\n')"
+docker exec -i ac-database mysql -uroot -p"$DBPASS" acore_world \
+  < ~/azerothcore/modules/mod-ah-bot/data/sql/db-world/mod_auctionhousebot.sql
+```
+
+### C) Create an AHBot account + character
+In worldserver console:
+```bash
+docker attach ac-worldserver
+```
+Then:
+```text
+account create ahbot ahbot
+```
+Detach: **Ctrl+p**, then **Ctrl+q**  
+Log into WoW once as `ahbot/ahbot`, create a character (e.g., `Ahbot`), enter world once, log out.
+
+> [!IMPORTANT]
+> Its essential you create this `Ahbot` character, enter the world and walk around a few seconds, I've read of some glitches otherwise. 
+
+
+### D) Create the real config (don’t edit only the `.dist`)
+Common pitfalls:
+- Don’t put your final config only in `~/azerothcore/modules/mod-ah-bot/conf/` (that’s just the template).
+- Don’t use `/azerothcore/...` on the VM (that path is inside containers). Use `~/azerothcore/...` on the host.
+
+```bash
+mkdir -p ~/azerothcore/env/dist/etc/modules
+cp ~/azerothcore/modules/mod-ah-bot/conf/mod_ahbot.conf.dist \
+   ~/azerothcore/env/dist/etc/modules/mod_ahbot.conf
+nano ~/azerothcore/env/dist/etc/modules/mod_ahbot.conf
+```
+
+Set:
+```ini
+AuctionHouseBot.EnableSeller = 1
+AuctionHouseBot.EnableBuyer  = 1
+AuctionHouseBot.Account      = <ACCOUNT_ID>
+AuctionHouseBot.GUID         = <CHAR_GUID>
+```
+
+Get `<ACCOUNT_ID>` + `<CHAR_GUID>`:
+```bash
+DBPASS="$(docker exec ac-database printenv MYSQL_ROOT_PASSWORD | tr -d '\r\n')"
+
+docker exec -i ac-database mysql -uroot -p"$DBPASS" -e "
+SELECT id, username FROM acore_auth.account WHERE username='AHBOT';
+SELECT guid, name, account FROM acore_characters.characters
+WHERE account=(SELECT id FROM acore_auth.account WHERE username='AHBOT');
+"
+```
+
+> [!IMPORTANT]
+> Bot fields `AuctionHouseBot.Account      = <ACCOUNT_ID>` and also `AuctionHouseBot.GUID         = <CHAR_GUID>` need to be populated. Then and only then proceed with below :-) . 
+
+
+Restart:
+```bash
+docker restart ac-worldserver
+```
+
+### E) Verify AH is being populated
+```bash
+DBPASS="$(docker exec ac-database printenv MYSQL_ROOT_PASSWORD | tr -d '\r\n')"
+docker exec -i ac-database mysql -uroot -p"$DBPASS" -e "
+USE acore_characters;
+SELECT COUNT(*) AS auctions_total FROM auctionhouse;
+"
+```
+
+---
+
+## 13.5 Optional: make the AH “bigger” (more leveling gear)
+AHBot’s “how many items should exist” is controlled in:
+`acore_world.mod_auctionhousebot` (`minitems`/`maxitems` per AH).
+
+Example (Alliance/Horde/Neutral = 2/6/7):
+```bash
+DBPASS="$(docker exec ac-database printenv MYSQL_ROOT_PASSWORD | tr -d '\r\n')"
+docker exec -i ac-database mysql -uroot -p"$DBPASS" -e "
+USE acore_world;
+UPDATE mod_auctionhousebot
+SET minitems=3000, maxitems=4000
+WHERE auctionhouse IN (2,6,7);
+SELECT auctionhouse,name,minitems,maxitems FROM mod_auctionhousebot;
+"
+docker restart ac-worldserver
+```
+
+---
+
+## 13.6 Again: Quick pitfalls I hit (hope this saves your sanity)
+- **`./acore.sh docker stop/install` may not exist** → use `docker compose down/stop`.
+- **Config paths differ**: your setup used `env/dist/...` (not `env/docker/...`).
+- **`.dist` files are templates** → copy to `.conf` (your real settings).
+- **Playerbots does not include AH population** → install **mod-ah-bot** separately.
+- **Seeing “only bots” in SQL**: don’t query “top 50 by level”, just query characters by your account if needed.
+
+---
+
+## 13.7 Troubleshooting (3 commands)
+
+### 1) Logs (Playerbots/AHBot)
+```bash
+docker logs --tail 200 ac-worldserver | egrep -i "playerbot|ahbot|auctionhousebot|error|warn"
+```
+
+### 2) AH health-check (DB auction count)
+```bash
+DBPASS="$(docker exec ac-database printenv MYSQL_ROOT_PASSWORD | tr -d '\r\n')"
+docker exec -i ac-database mysql -uroot -p"$DBPASS" -e "USE acore_characters; SELECT COUNT(*) AS auctions_total FROM auctionhouse;"
+```
+
+### 3) Confirm configs exist inside the container
+```bash
+docker exec -it ac-worldserver ls -la /azerothcore/env/dist/etc/modules | egrep -i "playerbots|ahbot|auction"
 
